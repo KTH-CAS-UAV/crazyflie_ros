@@ -26,10 +26,12 @@
 #include <std_msgs/Empty.h>
 #include "geometry_msgs/Twist.h"
 #include "geometry_msgs/PointStamped.h"
+#include "geometry_msgs/PoseStamped.h"
 #include "sensor_msgs/Imu.h"
 #include "sensor_msgs/Temperature.h"
 #include "sensor_msgs/MagneticField.h"
 #include "std_msgs/Float32.h"
+#include "tf/transform_datatypes.h"
 
 //#include <regex>
 #include <thread>
@@ -42,11 +44,11 @@
 
 constexpr double pi() { return 3.141592653589793238462643383279502884; }
 
-double degToRad(double deg) {
+static double degToRad(double deg) {
     return deg / 180.0 * pi();
 }
 
-double radToDeg(double rad) {
+static double radToDeg(double rad) {
     return rad * 180.0 / pi();
 }
 
@@ -127,6 +129,7 @@ public:
     , m_subscribeCmdPosition()
     , m_subscribeExternalPosition()
     , m_pubImu()
+    , m_pubPose()
     , m_pubTemp()
     , m_pubMag()
     , m_pubPressure()
@@ -174,6 +177,15 @@ private:
     float gyro_x;
     float gyro_y;
     float gyro_z;
+  } __attribute__((packed));
+
+  struct logPose {
+    float kalman_x;
+    float kalman_y;
+    float kalman_z;
+    float stabilizer_roll;
+    float stabilizer_pitch;
+    float stabilizer_yaw;
   } __attribute__((packed));
 
   struct log2 {
@@ -369,6 +381,9 @@ void cmdPositionSetpoint(
     if (m_enable_logging_imu) {
       m_pubImu = n.advertise<sensor_msgs::Imu>(m_tf_prefix + "/imu", 10);
     }
+    if (m_enable_logging_imu) {
+      m_pubPose = n.advertise<geometry_msgs::PoseStamped>(m_tf_prefix + "/pose", 10);
+    }
     if (m_enable_logging_temperature) {
       m_pubTemp = n.advertise<sensor_msgs::Temperature>(m_tf_prefix + "/temperature", 10);
     }
@@ -443,6 +458,7 @@ void cmdPositionSetpoint(
     }
 
     std::unique_ptr<LogBlock<logImu> > logBlockImu;
+    std::unique_ptr<LogBlock<logPose> > logBlockPose;
     std::unique_ptr<LogBlock<log2> > logBlock2;
     std::vector<std::unique_ptr<LogBlockGeneric> > logBlocksGeneric(m_logBlocks.size());
     if (m_enableLogging) {
@@ -466,6 +482,22 @@ void cmdPositionSetpoint(
             {"gyro", "z"},
           }, cb));
         logBlockImu->start(1); // 10ms
+      }
+
+      if (m_enable_logging_imu) {
+        std::function<void(uint32_t, logPose*)> cb = std::bind(&CrazyflieROS::onPoseData, this, std::placeholders::_1, std::placeholders::_2);
+
+        logBlockPose.reset(new LogBlock<logPose>(
+          &m_cf,{
+            {"kalman", "stateX"},
+            {"kalman", "stateY"},
+            {"kalman", "stateZ"},
+            {"stabilizer", "roll"},
+            {"stabilizer", "pitch"},
+            {"stabilizer", "yaw"},
+          }, cb));
+        logBlockPose->start(5); // 50ms (20 Hz)
+
       }
 
       if (   m_enable_logging_temperature
@@ -567,6 +599,26 @@ void cmdPositionSetpoint(
       msg.linear_acceleration.z = data->acc_z * 9.81;
 
       m_pubImu.publish(msg);
+    }
+  }
+
+  void onPoseData(uint32_t time_in_ms, logPose* data) {
+    if (m_enable_logging_imu) {
+      geometry_msgs::PoseStamped msg;
+      if (m_use_ros_time) {
+        msg.header.stamp = ros::Time::now();
+      } else {
+        msg.header.stamp = ros::Time(time_in_ms / 1000.0);
+      }
+      msg.header.frame_id = m_tf_prefix + "/odom";
+      msg.pose.position.x = data->kalman_x;
+      msg.pose.position.y = data->kalman_y;
+      msg.pose.position.z = data->kalman_z;
+      tf::Quaternion q(tf::createQuaternionFromRPY( degToRad(data->stabilizer_roll),
+                                                   -degToRad(data->stabilizer_pitch),
+                                                    degToRad(data->stabilizer_yaw)));
+      quaternionTFToMsg(q, msg.pose.orientation);
+      m_pubPose.publish(msg);
     }
   }
 
@@ -777,6 +829,7 @@ private:
   ros::Subscriber m_subscribeCmdPosition;
   ros::Subscriber m_subscribeExternalPosition;
   ros::Publisher m_pubImu;
+  ros::Publisher m_pubPose;
   ros::Publisher m_pubTemp;
   ros::Publisher m_pubMag;
   ros::Publisher m_pubPressure;
